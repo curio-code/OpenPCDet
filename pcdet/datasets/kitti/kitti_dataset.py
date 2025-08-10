@@ -63,7 +63,17 @@ class KittiDataset(DatasetTemplate):
     def get_lidar(self, idx):
         lidar_file = self.root_split_path / 'velodyne' / ('%s.bin' % idx)
         assert lidar_file.exists()
-        return np.fromfile(str(lidar_file), dtype=np.float32).reshape(-1, 4)
+        number_of_channels = 7  # ['x', 'y', 'z', 'rcs', 'v_r', 'v_r_comp', 'time']
+        points = np.fromfile(str(lidar_file), dtype=np.float32).reshape(-1, number_of_channels)
+
+        # #in practice, you should use either train, or train+val values to calculate mean and stds. Note that x, y, z, and time are not normed, but you can experiment with that.
+        # means = [0, 0, 0, mean_RCS (~ -13.0), mean_v_r (~-3.0), mean_vr_comp (~ -0.1), 0]  # 'x', 'y', 'z', 'rcs', 'v_r', 'v_r_comp', 'time'
+        # stds =  [1, 1, 1, std_RCS (~14.0),  std_v_r (~8.0),    std_v_r_comp (~6.0), 0]  # 'x', 'y', 'z', 'rcs', 'v_r', 'v_r_comp', 'time'
+
+
+        # #we then norm the channels
+        # points = (points - means)/stds
+        return points
 
     def get_image(self, idx):
         """
@@ -73,7 +83,9 @@ class KittiDataset(DatasetTemplate):
         Returns:
             image: (H, W, 3), RGB Image
         """
-        img_file = self.root_split_path / 'image_2' / ('%s.png' % idx)
+        img_file = self.root_split_path / 'image_2' / ('%s.jpg' % idx)
+        if not img_file.exists():
+            print(f"[ERROR] Missing image for frame ID: {idx} at path: {img_file}")
         assert img_file.exists()
         image = io.imread(img_file)
         image = image.astype(np.float32)
@@ -81,7 +93,9 @@ class KittiDataset(DatasetTemplate):
         return image
 
     def get_image_shape(self, idx):
-        img_file = self.root_split_path / 'image_2' / ('%s.png' % idx)
+        img_file = self.root_split_path / 'image_2' / ('%s.jpg' % idx)
+        if not img_file.exists():
+            print(f"[ERROR] Missing image for frame ID: {idx} at path: {img_file}")
         assert img_file.exists()
         return np.array(io.imread(img_file).shape[:2], dtype=np.int32)
 
@@ -474,11 +488,11 @@ if __name__ == '__main__':
         import yaml
         from pathlib import Path
         from easydict import EasyDict
-        dataset_cfg = EasyDict(yaml.safe_load(open(sys.argv[2])))
+        dataset_cfg = EasyDict(yaml.safe_load(open(sys.argv[2])))   
         ROOT_DIR = (Path(__file__).resolve().parent / '../../../').resolve()
         create_kitti_infos(
             dataset_cfg=dataset_cfg,
             class_names=['Car', 'Pedestrian', 'Cyclist'],
-            data_path=ROOT_DIR / 'data' / 'kitti',
-            save_path=ROOT_DIR / 'data' / 'kitti'
+            data_path=ROOT_DIR / 'data' / 'view_of_delft'/'radar_5frames',
+            save_path=ROOT_DIR / 'data' / 'view_of_delft'/'radar_5frames'
         )
