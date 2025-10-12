@@ -2,7 +2,6 @@
 import math
 import torch
 import torch.nn as nn
-from typing import Dict, List, Tuple
 
 class ClusterEnhancementBranch(nn.Module):
     """
@@ -17,6 +16,7 @@ class ClusterEnhancementBranch(nn.Module):
       - batch_dict['voxel_size'], batch_dict['point_cloud_range'], batch_dict['spatial_features_stride']
     """
     def __init__(self, model_cfg):
+        """Store configuration parameters and build the radar encoder components."""
         super().__init__()
         self.model_cfg = model_cfg
         self.out_channels = self.model_cfg.OUT_CHANNELS #64
@@ -27,6 +27,9 @@ class ClusterEnhancementBranch(nn.Module):
         self.min_pts = self.model_cfg.MIN_PTS # 10)
         self.vel_filter = self.model_cfg.VEL_FILTER # 'mad') # 'mad' or 'fixed'
         self.vel_thresh = self.model_cfg.VEL_THRESH #, 2.0)
+        
+        self.use_vr = self.model_cfg.USE_VR
+        self.use_vr_comp = self.model_cfg.USE_VR_COMP
 
         # optional static pc_range for projection if batch_dict lacks it
         self.pc_range = self.model_cfg.POINT_CLOUD_RANGE
@@ -40,109 +43,56 @@ class ClusterEnhancementBranch(nn.Module):
         )
 
     @torch.no_grad()
+    #verified
     def _adaptive_eps(self, xy):
+        """Compute an adaptive distance threshold per radar point using angular resolution."""
         d = torch.sqrt((xy[:, 0] ** 2) + (xy[:, 1] ** 2))
         Leps = 2.0 * d * math.sin(math.radians(self.eps_deg) * 0.5)
         floor_eps = 2.0 * float(self.range_res)
         Eps = torch.maximum(Leps, torch.as_tensor(floor_eps, device=xy.device, dtype=xy.dtype))
         return Eps
 
-    @staticmethod
-    def _xy_to_cell(x: float, y: float, xmin: float, ymin: float, inv_cell: float) -> Tuple[int, int]:
-        cx = int(math.floor((x - xmin) * inv_cell))
-        cy = int(math.floor((y - ymin) * inv_cell))
-        return cx, cy
-
     @torch.no_grad()
-    def _build_grid(self, xy_cpu: torch.Tensor, pc_range: List[float], cell_size: float) -> Dict[Tuple[int, int], List[int]]:
-        xmin, ymin = float(pc_range[0]), float(pc_range[1])
-        inv_cell = 1.0 / float(cell_size)
-        grid: Dict[Tuple[int, int], List[int]] = {}
-        x = xy_cpu[:, 0].tolist()
-        y = xy_cpu[:, 1].tolist()
-        for i in range(len(x)):
-            cx, cy = self._xy_to_cell(x[i], y[i], xmin, ymin, inv_cell)
-            grid.setdefault((cx, cy), []).append(i)
-        return grid
-
-    @torch.no_grad()
-    def _region_query(self,
-                      idx: int,
-                      xy_cpu: torch.Tensor,
-                      eps_cpu: torch.Tensor,
-                      grid: Dict[Tuple[int, int], List[int]],
-                      pc_range: List[float],
-                      cell_size: float) -> List[int]:
-        xmin, ymin = float(pc_range[0]), float(pc_range[1])
-        inv_cell = 1.0 / float(cell_size)
-        px = float(xy_cpu[idx, 0])
-        py = float(xy_cpu[idx, 1])
-        r = float(eps_cpu[idx])
-
-        # compute search window in grid coords
-        rc = int(math.ceil(r * inv_cell))
-        cx, cy = self._xy_to_cell(px, py, xmin, ymin, inv_cell)
-
-        cand: List[int] = []
-        for gy in range(cy - rc, cy + rc + 1):
-            for gx in range(cx - rc, cx + rc + 1):
-                lst = grid.get((gx, gy))
-                if lst:
-                    cand.extend(lst)
-
-        if not cand:
-            return []
-
-        cand_t = torch.as_tensor(cand, dtype=torch.long)
-        diff = xy_cpu[cand_t] - xy_cpu[idx]
-        d2 = (diff[:, 0] ** 2) + (diff[:, 1] ** 2)
-        mask = d2 <= (r * r + 1e-8)
-        return cand_t[mask].tolist()
-
-    @torch.no_grad()
-    def _dbscan_variable_eps_single(self, xy: torch.Tensor, eps: torch.Tensor, pc_range: List[float]) -> torch.Tensor:
+    def _dbscan_variable_eps_single(self, xy: torch.Tensor, eps: torch.Tensor) -> torch.Tensor:
+        """Run DBSCAN with per-point radii using a vectorized distance matrix."""
         N = xy.shape[0]
         if N == 0:
             return torch.empty((0,), dtype=torch.int32, device=xy.device)
 
-        # Work on CPU for neighbor search with Python structures
-        xy_cpu = xy.detach().cpu()
-        eps_cpu = eps.detach().cpu()
-        labels = torch.full((N,), -1, dtype=torch.int32)
-        visited = torch.zeros((N,), dtype=torch.bool)
+        dist = torch.cdist(xy, xy, p=2)
+        neighbor_mask = dist <= eps.unsqueeze(1)
+        core_mask = neighbor_mask.sum(dim=1) >= int(self.min_pts)
 
-        cell = max(2.0 * float(self.range_res), 1e-3)
-        grid = self._build_grid(xy_cpu, pc_range, cell)
-
+        labels = torch.full((N,), -1, dtype=torch.int32, device=xy.device)
+        unprocessed_core = core_mask.clone()
         cluster_id = 0
-        for i in range(N):
-            if visited[i].item():
-                continue
-            visited[i] = True
-            neighbors = self._region_query(i, xy_cpu, eps_cpu, grid, pc_range, cell)
-            if len(neighbors) < int(self.min_pts):
-                labels[i] = -1
-                continue
-            # start a new cluster
-            labels[i] = cluster_id
-            seeds = set(neighbors)
-            if i in seeds:
-                seeds.remove(i)
-            while seeds:
-                j = seeds.pop()
-                if not visited[j].item():
-                    visited[j] = True
-                    nhood = self._region_query(j, xy_cpu, eps_cpu, grid, pc_range, cell)
-                    if len(nhood) >= int(self.min_pts):
-                        seeds.update(nhood)
-                if labels[j].item() == -1:
-                    labels[j] = cluster_id
+
+        while torch.any(unprocessed_core):
+            seed_idx = torch.nonzero(unprocessed_core, as_tuple=False)[0, 0].item()
+            cluster_mask = torch.zeros((N,), dtype=torch.bool, device=xy.device)
+            frontier = torch.zeros((N,), dtype=torch.bool, device=xy.device)
+
+            cluster_mask[seed_idx] = True
+            frontier[seed_idx] = True
+
+            while frontier.any():
+                frontier_idx = frontier.nonzero(as_tuple=False).squeeze(1)
+                neighbors = neighbor_mask[frontier_idx]  # (F, N) boolean adjacency
+                reachable = neighbors.any(dim=0)
+                new_points = reachable & (~cluster_mask)
+
+                cluster_mask |= new_points
+                frontier = new_points & core_mask
+
+            labels[cluster_mask] = cluster_id
+            unprocessed_core &= ~cluster_mask
             cluster_id += 1
 
-        return labels.to(xy.device)
+        return labels
 
     @torch.no_grad()
-    def _cluster_ids_adaptive(self, xy: torch.Tensor, eps: torch.Tensor, bs_idx: torch.Tensor, pc_range) -> torch.Tensor:
+    def _cluster_ids_adaptive(self, xy: torch.Tensor, eps: torch.Tensor, bs_idx: torch.Tensor, pc_range=None) -> torch.Tensor:
+        """Cluster each batch independently and remap ids to remain unique across batches."""
         # Cluster per batch index; ensure unique cluster IDs across batches by offsetting
         if xy.numel() == 0:
             return torch.empty((0,), dtype=torch.int32, device=xy.device)
@@ -153,7 +103,7 @@ class ClusterEnhancementBranch(nn.Module):
         for b in uniq_bs:
             mask = (bs_idx == b)
             idxs = torch.nonzero(mask, as_tuple=False).squeeze(1)
-            labels_b = self._dbscan_variable_eps_single(xy[idxs], eps[idxs], pc_range)
+            labels_b = self._dbscan_variable_eps_single(xy[idxs], eps[idxs])
             # remap noise stays -1; valid clusters get offset
             pos = labels_b >= 0
             labels_b_out = torch.full_like(labels_b, -1)
@@ -164,6 +114,7 @@ class ClusterEnhancementBranch(nn.Module):
         return out
 
     def _velocity_prune(self, v_abs, cluster_ids):
+        """Reject velocity outliers inside each cluster via MAD or a fixed threshold."""
         keep = torch.ones_like(cluster_ids, dtype=torch.bool)
         for cid in cluster_ids.unique():
             if cid.item() < 0: continue
@@ -181,6 +132,7 @@ class ClusterEnhancementBranch(nn.Module):
         return keep
 
     def _bev_project_2x(self, xy, v_abs, bs_idx, pc_range, twoH, twoW):
+        """Project retained points into a 2× BEV image with count and mean velocity channels."""
         xmin, ymin, zmin, xmax, ymax, zmax = pc_range
         res_x = (xmax - xmin) / twoW   # note: W maps to x-range in PCDet BEV
         res_y = (ymax - ymin) / twoH   # and H maps to y-range (row-major)
@@ -204,7 +156,7 @@ class ClusterEnhancementBranch(nn.Module):
         return bev
 
     def forward(self, batch_dict):
-        """
+        """Run clustering, pruning, projection, and encoding to produce radar BEV features.
         Writes batch_dict['spatial_features_ceb'] with shape [B, C2, H, W]
         """
         # Acquire radar points: prefer 'points' (standard in PCDet) then optional 'points_radar'
@@ -221,7 +173,7 @@ class ClusterEnhancementBranch(nn.Module):
         # columns: [bs, x, y, z, rcs, v_r, v_r_comp, time]
         v_r_comp = pts[:, 6]
         v_r = pts[:, 5]
-        v_src = v_r_comp if torch.any(v_r_comp != 0) or not torch.all(torch.isnan(v_r_comp)) else v_r
+        v_src = v_r_comp if self.use_vr_comp or not self.use_vr else v_r
         v_abs = v_src.abs()
 
         # derive H,W from existing BEV (from PEB scatter)
