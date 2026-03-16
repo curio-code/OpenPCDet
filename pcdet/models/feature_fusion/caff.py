@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -49,10 +50,35 @@ class CAFF(nn.Module):
         - K,V from Pillar Enhancement Branch (FP_BEV)
     No conv-based embedding — just flatten + linear projection + positional encoding.
     """
-    def __init__(self, channels=64, nheads=8, dropout=0.0, use_se=True):
+    def __init__(self, model_cfg=None, **kwargs):
         super().__init__()
+        self.model_cfg = model_cfg
+
+        if self.model_cfg is not None and (
+            hasattr(self.model_cfg, 'CHANNELS') or hasattr(self.model_cfg, 'EMBED_DIM')
+        ):
+            channels = getattr(self.model_cfg, 'CHANNELS')
+            nheads = getattr(self.model_cfg, 'HEADS', getattr(self.model_cfg, 'NUM_HEADS', kwargs.get('nheads', 1)))
+            dropout = getattr(self.model_cfg, 'DROPOUT', getattr(self.model_cfg, 'DROP', kwargs.get('dropout', 0.0)))
+            use_se = getattr(self.model_cfg, 'USE_SE', getattr(self.model_cfg, 'USE_SENET', kwargs.get('use_se', False)))
+            se_reduction = getattr(self.model_cfg, 'SE_REDUCTION', getattr(self.model_cfg, 'SENET_REDUCTION', kwargs.get('se_reduction', 8)))
+        else:
+            channels = kwargs.get('channels', 64)
+            nheads = kwargs.get('nheads', 8)
+            dropout = kwargs.get('dropout', 0.0)
+            use_se = kwargs.get('use_se', True)
+            se_reduction = kwargs.get('se_reduction', 8)
+
+        if channels is None:
+            raise ValueError("CAFF must receive the BEV feature dimension via config or constructor arguments.")
+
         self.C = channels
         self.nheads = nheads
+        channels = self.C
+        self.patch_size = getattr(self.model_cfg, 'PATCH_SIZE', kwargs.get('patch_size', 1))
+        self.patch_stride = getattr(self.model_cfg, 'PATCH_STRIDE', kwargs.get('patch_stride', self.patch_size))
+        self.patch_kernel = getattr(self.model_cfg, 'PATCH_KERNEL', kwargs.get('patch_kernel', self.patch_size))
+        self.patch_padding = getattr(self.model_cfg, 'PATCH_PADDING', kwargs.get('patch_padding', 0))
 
         # Linear projections for Q, K, V
         c = (6 / (channels + channels))**0.5
@@ -75,13 +101,13 @@ class CAFF(nn.Module):
         self.delta4 = nn.Parameter(torch.ones(1))
 
         # Learnable positional encodings
-        self.pos_pillar = None
-        self.pos_cluster = None
+        self.pos_embed = None
+        self.pos_embed_cluster = None
 
         # Optional SENet + channel fusion (as in paper)
         self.use_se = use_se
         if use_se:
-            self.se = SEBlock(channels)
+            self.se = SEBlock(channels, reduction=se_reduction)
 
         self.fuse = nn.Sequential(
             nn.Conv2d(2 * channels, channels, kernel_size=1, bias=False),
@@ -90,16 +116,53 @@ class CAFF(nn.Module):
         )
 
         self.dropout = nn.Dropout(dropout)
+        self.patch_embed_p = nn.Identity()
+        self.patch_embed_d = nn.Identity()
 
     def _make_pos_encoding(self, H, W, device):
         """Create or update learnable positional encodings of shape (HW, 1, C)."""
-        if (self.pos_pillar is None) or (self.pos_pillar.shape[0] != H * W):
-            self.pos_pillar = nn.Parameter(torch.empty(H * W, 1, self.C, device=device))
-            self.pos_cluster = nn.Parameter(torch.empty(H * W, 1, self.C, device=device))
-            nn.init.trunc_normal_(self.pos_pillar, std=0.02)  
-            nn.init.trunc_normal_(self.pos_cluster, std=0.02)
+        num_tokens = H * W
+        needs_init = (
+            self.pos_embed is None
+            or self.pos_embed.shape[1] != num_tokens
+            or self.pos_embed.device != device
+        )
+        if needs_init:
+            self.pos_embed = nn.Parameter(torch.empty(1, num_tokens, self.C, device=device))
+            self.pos_embed_cluster = nn.Parameter(torch.empty(1, num_tokens, self.C, device=device))
+            nn.init.trunc_normal_(self.pos_embed, std=0.02)
+            nn.init.trunc_normal_(self.pos_embed_cluster, std=0.02)
 
-    def forward(self, FP_BEV, FD_BEV):
+        pos_pillar = self.pos_embed.view(1, num_tokens, self.C).permute(1, 0, 2)
+        pos_cluster = self.pos_embed_cluster.view(1, num_tokens, self.C).permute(1, 0, 2)
+        return pos_pillar, pos_cluster
+
+    def forward(self, *args):
+        """
+        Supports two calling patterns:
+            1. forward(batch_dict) where batch_dict carries the required tensors and will be updated in-place.
+            2. forward(FP_BEV, FD_BEV) returning the fused tensor directly.
+        """
+        if len(args) == 1 and isinstance(args[0], dict):
+            batch_dict = args[0]
+            FP_BEV = batch_dict.get('spatial_features', None)
+            FD_BEV = batch_dict.get('spatial_features_ceb', None)
+            assert FP_BEV is not None, "CAFF expects 'spatial_features' from PEB in batch_dict."
+            assert FD_BEV is not None, "CAFF expects 'spatial_features_ceb' from CEB in batch_dict."
+
+            fused = self._fuse(FP_BEV, FD_BEV)
+            batch_dict['spatial_features_peb'] = FP_BEV
+            batch_dict['spatial_features_fused'] = fused
+            batch_dict['spatial_features'] = fused
+            return batch_dict
+
+        if len(args) != 2:
+            raise ValueError("CAFF.forward expects either (batch_dict,) or (FP_BEV, FD_BEV).")
+
+        FP_BEV, FD_BEV = args
+        return self._fuse(FP_BEV, FD_BEV)
+
+    def _fuse(self, FP_BEV, FD_BEV):
         """
         Args:
             FP_BEV: Pillar branch BEV features (B, C, H, W) -> K,V
@@ -107,7 +170,22 @@ class CAFF(nn.Module):
         Returns:
             F_fused: (B, C, H, W)
         """
+        if FP_BEV.shape[1] != self.C:
+            if (self.pillar_proj is None) or (self.pillar_proj.in_channels != FP_BEV.shape[1]):
+                self.pillar_proj = nn.Conv2d(FP_BEV.shape[1], self.C, kernel_size=1, bias=False)
+                self.pillar_proj = self.pillar_proj.to(device=FP_BEV.device, dtype=FP_BEV.dtype)
+                nn.init.kaiming_uniform_(self.pillar_proj.weight, a=math.sqrt(5))
+            FP_BEV = self.pillar_proj(FP_BEV)
+
+        if FD_BEV.shape[1] != self.C:
+            if (self.cluster_proj is None) or (self.cluster_proj.in_channels != FD_BEV.shape[1]):
+                self.cluster_proj = nn.Conv2d(FD_BEV.shape[1], self.C, kernel_size=1, bias=False)
+                self.cluster_proj = self.cluster_proj.to(device=FD_BEV.device, dtype=FD_BEV.dtype)
+                nn.init.kaiming_uniform_(self.cluster_proj.weight, a=math.sqrt(5))
+            FD_BEV = self.cluster_proj(FD_BEV)
+
         B, C, H, W = FP_BEV.shape
+        assert self.C % self.nheads == 0, "CHANNELS must be divisible by number of HEADS."
         device = FP_BEV.device
         self._make_pos_encoding(H, W, device)
 
