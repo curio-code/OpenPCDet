@@ -37,6 +37,28 @@ class KittiDataset(DatasetTemplate):
             self.logger.info('Loading KITTI dataset')
         kitti_infos = []
 
+        sampled_num_cfg = self.dataset_cfg.get('SAMPLED_NUM', None)
+        sampled_num = None
+        if sampled_num_cfg is not None:
+            if isinstance(sampled_num_cfg, dict):
+                sampled_num = sampled_num_cfg.get(mode, sampled_num_cfg.get('default', None))
+            else:
+                sampled_num = sampled_num_cfg
+            if sampled_num is not None and sampled_num <= 0:
+                sampled_num = None
+
+        sampled_frames_cfg = self.dataset_cfg.get('SAMPLED_FRAME_IDS', None)
+        sampled_frames = None
+        if sampled_frames_cfg is not None:
+            if isinstance(sampled_frames_cfg, dict):
+                sampled_frames = sampled_frames_cfg.get(mode, sampled_frames_cfg.get('default', None))
+            else:
+                sampled_frames = sampled_frames_cfg
+            if isinstance(sampled_frames, (str, int)):
+                sampled_frames = [sampled_frames]
+            if sampled_frames is not None and len(sampled_frames) == 0:
+                sampled_frames = None
+
         for info_path in self.dataset_cfg.INFO_PATH[mode]:
             info_path = self.root_path / info_path
             if not info_path.exists():
@@ -44,6 +66,17 @@ class KittiDataset(DatasetTemplate):
             with open(info_path, 'rb') as f:
                 infos = pickle.load(f)
                 kitti_infos.extend(infos)
+
+        if sampled_frames is not None:
+            sampled_frames = [str(x) for x in sampled_frames]
+            frame_order = {frame_id: order for order, frame_id in enumerate(sampled_frames)}
+            kitti_infos = [info for info in kitti_infos if info['point_cloud']['lidar_idx'] in frame_order]
+            kitti_infos.sort(key=lambda info: frame_order[info['point_cloud']['lidar_idx']])
+
+        if sampled_num is not None:
+            sampled_num = min(sampled_num, len(kitti_infos))
+            if sampled_num < len(kitti_infos):
+                kitti_infos = kitti_infos[:sampled_num]
 
         self.kitti_infos.extend(kitti_infos)
 
@@ -63,7 +96,7 @@ class KittiDataset(DatasetTemplate):
     def get_lidar(self, idx):
         lidar_file = self.root_split_path / 'velodyne' / ('%s.bin' % idx)
         assert lidar_file.exists()
-        number_of_channels = 7  # ['x', 'y', 'z', 'rcs', 'v_r', 'v_r_comp', 'time']
+        number_of_channels = len(self.dataset_cfg.POINT_FEATURE_ENCODING.src_feature_list)
         points = np.fromfile(str(lidar_file), dtype=np.float32).reshape(-1, number_of_channels)
 
         # #in practice, you should use either train, or train+val values to calculate mean and stds. Note that x, y, z, and time are not normed, but you can experiment with that.
@@ -490,9 +523,10 @@ if __name__ == '__main__':
         from easydict import EasyDict
         dataset_cfg = EasyDict(yaml.safe_load(open(sys.argv[2])))   
         ROOT_DIR = (Path(__file__).resolve().parent / '../../../').resolve()
+        data_path = Path(dataset_cfg.DATA_PATH)
         create_kitti_infos(
             dataset_cfg=dataset_cfg,
             class_names=['Car', 'Pedestrian', 'Cyclist'],
-            data_path=ROOT_DIR / 'data' / 'view_of_delft'/'radar_5frames',
-            save_path=ROOT_DIR / 'data' / 'view_of_delft'/'radar_5frames'
+            data_path=data_path,
+            save_path=data_path
         )

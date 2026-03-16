@@ -167,17 +167,21 @@ class ClusterEnhancementBranch(nn.Module):
             "Expected 'points' with columns [bs,x,y,z,rcs,v_r,v_r_comp,time] or 'points_radar'"
         )
 
-        bs_idx = pts[:, 0].long()
-        xy = pts[:, 1:3]
+        spatial_features = batch_dict['spatial_features']   # [B, Cpeb, H, W]
+        device = spatial_features.device
+        dtype = spatial_features.dtype
+
+        # Run clustering-heavy ops on CPU to keep GPU memory usage low.
+        pts_cpu = pts.to(device=torch.device('cpu'))
+        bs_idx = pts_cpu[:, 0].long()
+        xy = pts_cpu[:, 1:3]
         # choose velocity source: prefer compensated if present
         # columns: [bs, x, y, z, rcs, v_r, v_r_comp, time]
-        v_r_comp = pts[:, 6]
-        v_r = pts[:, 5]
+        v_r_comp = pts_cpu[:, 6]
+        v_r = pts_cpu[:, 5]
         v_src = v_r_comp if self.use_vr_comp or not self.use_vr else v_r
         v_abs = v_src.abs()
 
-        # derive H,W from existing BEV (from PEB scatter)
-        spatial_features = batch_dict['spatial_features']   # [B, Cpeb, H, W]
         B, _, H, W = spatial_features.shape
         twoH, twoW = 2*H, 2*W
 
@@ -203,6 +207,7 @@ class ClusterEnhancementBranch(nn.Module):
             pc_range_list, twoH, twoW
         )  # [B,2,2H,2W]
 
+        bev2x = bev2x.to(device=device, dtype=dtype)
         feat = self.enc(bev2x)  # [B,C2,H,W]
         batch_dict['spatial_features_ceb'] = feat
         return batch_dict

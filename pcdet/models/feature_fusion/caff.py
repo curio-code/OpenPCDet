@@ -25,7 +25,6 @@ class FeedForward(nn.Module):
         return self.FF(x)
 
 class SEBlock(nn.Module):
-    """SENet module as in the paper, applied after CAFF fusion."""
     def __init__(self, c, reduction=8):
         super().__init__()
         self.pool = nn.AdaptiveAvgPool2d(1)
@@ -75,10 +74,6 @@ class CAFF(nn.Module):
         self.C = channels
         self.nheads = nheads
         channels = self.C
-        self.patch_size = getattr(self.model_cfg, 'PATCH_SIZE', kwargs.get('patch_size', 1))
-        self.patch_stride = getattr(self.model_cfg, 'PATCH_STRIDE', kwargs.get('patch_stride', self.patch_size))
-        self.patch_kernel = getattr(self.model_cfg, 'PATCH_KERNEL', kwargs.get('patch_kernel', self.patch_size))
-        self.patch_padding = getattr(self.model_cfg, 'PATCH_PADDING', kwargs.get('patch_padding', 0))
 
         # Linear projections for Q, K, V
         c = (6 / (channels + channels))**0.5
@@ -101,8 +96,8 @@ class CAFF(nn.Module):
         self.delta4 = nn.Parameter(torch.ones(1))
 
         # Learnable positional encodings
-        self.pos_embed = None
-        self.pos_embed_cluster = None
+        self.pos_pillar = None
+        self.pos_cluster = None
 
         # Optional SENet + channel fusion (as in paper)
         self.use_se = use_se
@@ -116,26 +111,16 @@ class CAFF(nn.Module):
         )
 
         self.dropout = nn.Dropout(dropout)
-        self.patch_embed_p = nn.Identity()
-        self.patch_embed_d = nn.Identity()
+        self.pillar_proj = None
+        self.cluster_proj = None
 
     def _make_pos_encoding(self, H, W, device):
         """Create or update learnable positional encodings of shape (HW, 1, C)."""
-        num_tokens = H * W
-        needs_init = (
-            self.pos_embed is None
-            or self.pos_embed.shape[1] != num_tokens
-            or self.pos_embed.device != device
-        )
-        if needs_init:
-            self.pos_embed = nn.Parameter(torch.empty(1, num_tokens, self.C, device=device))
-            self.pos_embed_cluster = nn.Parameter(torch.empty(1, num_tokens, self.C, device=device))
-            nn.init.trunc_normal_(self.pos_embed, std=0.02)
-            nn.init.trunc_normal_(self.pos_embed_cluster, std=0.02)
-
-        pos_pillar = self.pos_embed.view(1, num_tokens, self.C).permute(1, 0, 2)
-        pos_cluster = self.pos_embed_cluster.view(1, num_tokens, self.C).permute(1, 0, 2)
-        return pos_pillar, pos_cluster
+        if (self.pos_pillar is None) or (self.pos_pillar.shape[0] != H * W):
+            self.pos_pillar = nn.Parameter(torch.empty(H * W, 1, self.C, device=device))
+            self.pos_cluster = nn.Parameter(torch.empty(H * W, 1, self.C, device=device))
+            nn.init.trunc_normal_(self.pos_pillar, std=0.02)  
+            nn.init.trunc_normal_(self.pos_cluster, std=0.02)
 
     def forward(self, *args):
         """

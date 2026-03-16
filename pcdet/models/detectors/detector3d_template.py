@@ -1,4 +1,5 @@
 import os
+import pickle
 
 import torch
 import torch.nn as nn
@@ -358,16 +359,43 @@ class Detector3DTemplate(nn.Module):
             self.load_state_dict(state_dict)
         return state_dict, update_model_state
 
+    @staticmethod
+    def _torch_load_with_weights_fallback(filename, logger=None, *, map_location=None):
+        load_kwargs = {}
+        if map_location is not None:
+            load_kwargs['map_location'] = map_location
+        try:
+            return torch.load(filename, **load_kwargs)
+        except Exception as err:
+            needs_retry = isinstance(err, pickle.UnpicklingError) or (
+                isinstance(err, RuntimeError) and 'Weights only load failed' in str(err)
+            )
+            if not needs_retry:
+                raise
+
+            if logger is not None:
+                logger.warning(
+                    'torch.load failed with safe weights-only mode for %s (%s). '
+                    'Retrying with weights_only=False; ensure the checkpoint source is trusted.',
+                    filename, err
+                )
+            load_kwargs['weights_only'] = False
+            try:
+                return torch.load(filename, **load_kwargs)
+            except TypeError:
+                load_kwargs.pop('weights_only', None)
+                return torch.load(filename, **load_kwargs)
+
     def load_params_from_file(self, filename, logger, to_cpu=False, pre_trained_path=None):
         if not os.path.isfile(filename):
             raise FileNotFoundError
 
         logger.info('==> Loading parameters from checkpoint %s to %s' % (filename, 'CPU' if to_cpu else 'GPU'))
         loc_type = torch.device('cpu') if to_cpu else None
-        checkpoint = torch.load(filename, map_location=loc_type)
+        checkpoint = self._torch_load_with_weights_fallback(filename, logger, map_location=loc_type)
         model_state_disk = checkpoint['model_state']
         if not pre_trained_path is None:
-            pretrain_checkpoint = torch.load(pre_trained_path, map_location=loc_type)
+            pretrain_checkpoint = self._torch_load_with_weights_fallback(pre_trained_path, logger, map_location=loc_type)
             pretrain_model_state_disk = pretrain_checkpoint['model_state']
             model_state_disk.update(pretrain_model_state_disk)
             
@@ -389,7 +417,7 @@ class Detector3DTemplate(nn.Module):
 
         logger.info('==> Loading parameters from checkpoint %s to %s' % (filename, 'CPU' if to_cpu else 'GPU'))
         loc_type = torch.device('cpu') if to_cpu else None
-        checkpoint = torch.load(filename, map_location=loc_type)
+        checkpoint = self._torch_load_with_weights_fallback(filename, logger, map_location=loc_type)
         epoch = checkpoint.get('epoch', -1)
         it = checkpoint.get('it', 0.0)
 
@@ -405,7 +433,7 @@ class Detector3DTemplate(nn.Module):
                 src_file, ext = filename[:-4], filename[-3:]
                 optimizer_filename = '%s_optim.%s' % (src_file, ext)
                 if os.path.exists(optimizer_filename):
-                    optimizer_ckpt = torch.load(optimizer_filename, map_location=loc_type)
+                    optimizer_ckpt = self._torch_load_with_weights_fallback(optimizer_filename, logger, map_location=loc_type)
                     optimizer.load_state_dict(optimizer_ckpt['optimizer_state'])
 
         if 'version' in checkpoint:
